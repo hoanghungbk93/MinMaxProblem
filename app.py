@@ -15,6 +15,9 @@ from scipy.optimize import minimize, NonlinearConstraint
 from typing import Callable, Tuple, List, Dict, Optional
 import re
 import warnings
+import time
+from sympy import sympify, lambdify, symbols, sqrt, sin, cos, tan, exp, log, pi, E
+from sympy.parsing.latex import parse_latex
 
 warnings.filterwarnings('ignore')
 
@@ -46,6 +49,241 @@ SAFE_MATH_FUNCTIONS = {
     'min': np.minimum,
     'max': np.maximum,
 }
+
+
+# =============================================================================
+# LATEX TO SYMPY PARSER
+# =============================================================================
+
+class LaTeXParser:
+    """Convert LaTeX expressions from MathLive to SymPy-compatible format."""
+
+    @staticmethod
+    def clean_latex_to_sympy(latex_str: str) -> str:
+        """
+        Convert LaTeX string to a SymPy-compatible Python expression.
+
+        Examples:
+        - \frac{a^{2}}{b} -> ((a)**(2))/(b)
+        - \sqrt{a} -> sqrt(a)
+        - a^{2} -> (a)**(2)
+        - \cdot -> *
+        - \sin(x) -> sin(x)
+        """
+        if not latex_str or not latex_str.strip():
+            return ""
+
+        result = latex_str.strip()
+
+        # Remove display math delimiters if present
+        result = re.sub(r'^\$\$?|\$\$?$', '', result)
+        result = re.sub(r'^\\\[|\\]$', '', result)
+
+        # Handle fractions: \frac{num}{denom} -> (num)/(denom)
+        # This regex handles nested braces properly
+        def replace_frac(match):
+            # Find matching braces for numerator
+            full = match.group(0)
+            rest = full[5:]  # Remove \frac
+
+            # Extract numerator (content within first {})
+            num, rest = LaTeXParser._extract_braces(rest)
+            # Extract denominator (content within second {})
+            denom, rest = LaTeXParser._extract_braces(rest)
+
+            return f"(({num}))/({denom}){rest}"
+
+        # Replace fractions iteratively (handle nested fractions)
+        while r'\frac' in result:
+            new_result = re.sub(r'\\frac\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',
+                               lambda m: f"(({m.group(1)}))/({m.group(2)})", result)
+            if new_result == result:
+                break
+            result = new_result
+
+        # Handle square root: \sqrt{x} -> sqrt(x)
+        result = re.sub(r'\\sqrt\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}', r'sqrt(\1)', result)
+
+        # Handle nth root: \sqrt[n]{x} -> (x)**(1/(n))
+        result = re.sub(r'\\sqrt\[([^\]]+)\]\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',
+                       r'((\2))**(1/(\1))', result)
+
+        # Handle power with braces: a^{2} -> (a)**(2)
+        result = re.sub(r'\^{([^{}]+)}', r'**(\1)', result)
+
+        # Handle simple power: a^2 -> (a)**(2) - but only single char/digit
+        result = re.sub(r'\^(\d+)', r'**(\1)', result)
+        result = re.sub(r'\^([a-zA-Z])', r'**(\1)', result)
+
+        # Handle subscripts (remove for now or convert to variable naming)
+        result = re.sub(r'_\{([^{}]+)\}', r'_\1', result)
+        result = re.sub(r'_(\d+)', r'_\1', result)
+
+        # Handle trigonometric and other functions
+        result = re.sub(r'\\sin\s*', 'sin', result)
+        result = re.sub(r'\\cos\s*', 'cos', result)
+        result = re.sub(r'\\tan\s*', 'tan', result)
+        result = re.sub(r'\\log\s*', 'log', result)
+        result = re.sub(r'\\ln\s*', 'log', result)
+        result = re.sub(r'\\exp\s*', 'exp', result)
+        result = re.sub(r'\\abs\s*', 'abs', result)
+
+        # Handle |x| absolute value notation
+        result = re.sub(r'\|([^|]+)\|', r'abs(\1)', result)
+        result = re.sub(r'\\left\|([^|]+)\\right\|', r'abs(\1)', result)
+
+        # Handle multiplication operators
+        result = result.replace(r'\cdot', '*')
+        result = result.replace(r'\times', '*')
+        result = result.replace(r'\ast', '*')
+
+        # Handle division
+        result = result.replace(r'\div', '/')
+
+        # Handle constants
+        result = result.replace(r'\pi', 'pi')
+        result = re.sub(r'\\mathrm\{e\}', 'E', result)
+
+        # Handle parentheses
+        result = result.replace(r'\left(', '(')
+        result = result.replace(r'\right)', ')')
+        result = result.replace(r'\left[', '(')
+        result = result.replace(r'\right]', ')')
+        result = result.replace(r'\{', '(')
+        result = result.replace(r'\}', ')')
+
+        # Replace remaining curly braces with parentheses (avoid Python set literal)
+        result = result.replace('{', '(')
+        result = result.replace('}', ')')
+
+        # Handle plus/minus
+        result = result.replace(r'\pm', '+')
+        result = result.replace(r'\mp', '-')
+
+        # Handle comparison operators (for constraints)
+        result = result.replace(r'\geq', '>=')
+        result = result.replace(r'\leq', '<=')
+        result = result.replace(r'\ge', '>=')
+        result = result.replace(r'\le', '<=')
+        result = result.replace(r'\neq', '!=')
+
+        # Remove remaining backslashes and LaTeX commands
+        result = re.sub(r'\\[a-zA-Z]+', '', result)
+
+        # Add implicit multiplication: 2a -> 2*a, a b -> a*b
+        # But NOT for function names like sqrt, sin, cos, etc.
+        func_names = ['sqrt', 'sin', 'cos', 'tan', 'log', 'ln', 'exp', 'abs', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh']
+
+        # Number followed by letter
+        result = re.sub(r'(\d)([a-zA-Z])', r'\1*\2', result)
+        # Letter followed by number (for things like a2 meaning a*2, less common)
+        # result = re.sub(r'([a-zA-Z])(\d)', r'\1*\2', result)
+        # Closing paren followed by letter or number
+        result = re.sub(r'\)([a-zA-Z0-9])', r')*\1', result)
+
+        # Letter/number followed by opening paren - but exclude function names
+        def add_mult_before_paren(match):
+            before = match.group(1)
+            # Check if this ends with a function name
+            for func in func_names:
+                if before.endswith(func):
+                    return match.group(0)  # Don't add multiplication
+            return before + '*('
+
+        result = re.sub(r'([a-zA-Z0-9]+)\(', add_mult_before_paren, result)
+
+        # Clean up extra spaces
+        result = re.sub(r'\s+', ' ', result).strip()
+
+        return result
+
+    @staticmethod
+    def _extract_braces(s: str) -> Tuple[str, str]:
+        """Extract content within first {} and return (content, remaining)."""
+        if not s or s[0] != '{':
+            return '', s
+
+        depth = 0
+        for i, c in enumerate(s):
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return s[1:i], s[i+1:]
+
+        return s[1:], ''
+
+    @staticmethod
+    def latex_to_sympy_expr(latex_str: str, var_names: List[str]):
+        """
+        Parse LaTeX string and return a SymPy expression.
+        Falls back to clean_latex_to_sympy if parse_latex fails.
+        """
+        if not latex_str or not latex_str.strip():
+            return None
+
+        try:
+            # Try SymPy's built-in LaTeX parser first
+            expr = parse_latex(latex_str)
+            return expr
+        except Exception:
+            pass
+
+        # Fallback: clean the LaTeX and use sympify
+        try:
+            cleaned = LaTeXParser.clean_latex_to_sympy(latex_str)
+            if cleaned:
+                # Create symbols
+                syms = symbols(' '.join(var_names))
+                if len(var_names) == 1:
+                    syms = [syms]
+                local_dict = {name: sym for name, sym in zip(var_names, syms)}
+                local_dict['pi'] = pi
+                local_dict['E'] = E
+                local_dict['e'] = E
+
+                expr = sympify(cleaned, locals=local_dict)
+                return expr
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def create_numpy_function(latex_str: str, var_names: List[str]) -> Tuple[Callable, str, str]:
+        """
+        Convert LaTeX to a NumPy-compatible callable function.
+
+        Returns: (function, cleaned_python_expr, error_message)
+        """
+        if not latex_str or not latex_str.strip():
+            return None, "", "Expression is empty"
+
+        # First clean the LaTeX
+        cleaned = LaTeXParser.clean_latex_to_sympy(latex_str)
+
+        try:
+            # Create SymPy symbols
+            syms = symbols(' '.join(var_names))
+            if len(var_names) == 1:
+                syms = (syms,)
+
+            local_dict = {name: sym for name, sym in zip(var_names, syms)}
+            local_dict['pi'] = pi
+            local_dict['E'] = E
+            local_dict['e'] = E
+
+            # Parse the cleaned expression
+            expr = sympify(cleaned, locals=local_dict)
+
+            # Create numpy-compatible function
+            numpy_func = lambdify(syms, expr, modules=['numpy'])
+
+            return numpy_func, cleaned, ""
+
+        except Exception as e:
+            return None, cleaned, str(e)
 
 
 # =============================================================================
@@ -102,6 +340,15 @@ class SafeExpressionParser:
 
         prepared_expr = cls.prepare_expression(expr)
 
+        # First try using SymPy for more robust parsing
+        try:
+            numpy_func, _, error = LaTeXParser.create_numpy_function(prepared_expr, variables)
+            if numpy_func is not None:
+                return numpy_func
+        except Exception:
+            pass
+
+        # Fallback to eval-based parsing
         def func(*args):
             if len(args) != len(variables):
                 raise ValueError(f"Expected {len(variables)} arguments, got {len(args)}")
@@ -142,13 +389,14 @@ class OptimizationEngine:
         except:
             return 1e10  # Return large value for invalid points
 
-    def _objective_with_penalty(self, x: np.ndarray, penalty_weight: float = 1000) -> float:
-        """Objective with constraint penalty."""
+    def _objective_with_penalty(self, x: np.ndarray, penalty_weight: float = 100000) -> float:
+        """Objective with constraint penalty (higher weight for better constraint satisfaction)."""
         obj_val = self._objective_wrapper(x)
 
         if self.constraint_func is not None:
             try:
                 constraint_val = self.constraint_func(*x)
+                # Use very high penalty to enforce constraint
                 penalty = penalty_weight * constraint_val ** 2
                 obj_val += penalty
             except:
@@ -157,35 +405,47 @@ class OptimizationEngine:
         return obj_val
 
     def gradient_descent(self, x0: np.ndarray, learning_rate: float = 0.01,
-                         iterations: int = 100, epsilon: float = 1e-7) -> Tuple[np.ndarray, List[np.ndarray], List[float]]:
-        """Manual gradient descent with path tracking and function values."""
+                         iterations: int = 100, epsilon: float = 1e-6) -> Tuple[np.ndarray, List[np.ndarray], List[float]]:
+        """
+        Gradient Descent: θ_{t+1} = θ_t - η * ∇f(θ_t)
+        Reference: https://machinelearningcoban.com/2017/01/12/gradientdescent/
+        """
         x = x0.copy().astype(float)
         path = [x.copy()]
         f_values = [self._objective_wrapper(x)]
 
         for iter_num in range(iterations):
-            # Numerical gradient
+            # Compute gradient numerically: ∇f ≈ [f(x+ε) - f(x-ε)] / (2ε)
             grad = np.zeros_like(x)
             for i in range(len(x)):
                 x_plus = x.copy()
                 x_plus[i] += epsilon
                 x_minus = x.copy()
                 x_minus[i] -= epsilon
-                grad[i] = (self._objective_with_penalty(x_plus) -
-                          self._objective_with_penalty(x_minus)) / (2 * epsilon)
 
-            # Update step with gradient descent
-            x = x - learning_rate * grad
+                # Use penalty function if constraint exists
+                if self.constraint_func is not None:
+                    grad[i] = (self._objective_with_penalty(x_plus) -
+                              self._objective_with_penalty(x_minus)) / (2 * epsilon)
+                else:
+                    # Pure gradient descent for unconstrained
+                    grad[i] = (self._objective_wrapper(x_plus) -
+                              self._objective_wrapper(x_minus)) / (2 * epsilon)
 
-            # Clip to bounds
+            # Gradient descent update: x = x - η * ∇f(x)
+            x_new = x - learning_rate * grad
+
+            # Project back to bounds
             for i, (lb, ub) in enumerate(self.bounds):
-                x[i] = np.clip(x[i], lb, ub)
+                x_new[i] = np.clip(x_new[i], lb, ub)
 
+            x = x_new
             path.append(x.copy())
             f_values.append(self._objective_wrapper(x))
 
-            # Check convergence
-            if np.linalg.norm(grad) < epsilon:
+            # Check convergence: ||∇f|| < ε
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm < 1e-6:
                 break
 
         return x, path, f_values
@@ -520,6 +780,134 @@ class Visualizer:
                 x=0.01,
                 bgcolor='rgba(255,255,255,0.8)'
             ),
+            hovermode='closest'
+        )
+
+        return fig
+
+    @staticmethod
+    def create_animated_contour_frame(func: Callable, x_range: Tuple[float, float],
+                                       y_range: Tuple[float, float],
+                                       path: List[np.ndarray],
+                                       current_step: int,
+                                       resolution: int = 50,
+                                       var_names: List[str] = ['a', 'b'],
+                                       constraint_func: Callable = None) -> go.Figure:
+        """Create a single frame of the animated contour plot."""
+        x = np.linspace(x_range[0], x_range[1], resolution)
+        y = np.linspace(y_range[0], y_range[1], resolution)
+        X, Y = np.meshgrid(x, y)
+
+        Z = np.zeros_like(X)
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                try:
+                    Z[i, j] = func(X[i, j], Y[i, j])
+                except:
+                    Z[i, j] = np.nan
+
+        fig = go.Figure()
+
+        # Add contour as background
+        fig.add_trace(go.Contour(
+            x=x, y=y, z=Z,
+            colorscale='Viridis',
+            contours=dict(showlabels=True, labelfont=dict(size=10, color='white')),
+            name='f({}, {})'.format(*var_names),
+            opacity=0.9,
+            colorbar=dict(title='f(a,b)', x=1.02)
+        ))
+
+        # Add constraint curve if provided
+        if constraint_func is not None:
+            C = np.zeros_like(X)
+            for i in range(X.shape[0]):
+                for j in range(X.shape[1]):
+                    try:
+                        C[i, j] = constraint_func(X[i, j], Y[i, j])
+                    except:
+                        C[i, j] = np.nan
+
+            fig.add_trace(go.Contour(
+                x=x, y=y, z=C,
+                contours=dict(start=0, end=0, size=0.01, coloring='lines'),
+                line=dict(color='red', width=4, dash='dash'),
+                showscale=False,
+                name='Constraint (g=0)'
+            ))
+
+        # Get path up to current step
+        if path is not None and len(path) >= 1:
+            path_array = np.array(path[:current_step + 1])
+            n_points = len(path_array)
+
+            if n_points >= 2:
+                # Draw path segments with gradient color
+                for i in range(n_points - 1):
+                    t = i / max(n_points - 2, 1)
+                    color = f'rgb({int(255*t)}, {int(100*(1-t))}, {int(255*(1-t))})'
+                    fig.add_trace(go.Scatter(
+                        x=[path_array[i, 0], path_array[i+1, 0]],
+                        y=[path_array[i, 1], path_array[i+1, 1]],
+                        mode='lines',
+                        line=dict(color=color, width=3),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+
+                # Path points
+                sizes = np.linspace(6, 3, n_points)
+                fig.add_trace(go.Scatter(
+                    x=path_array[:, 0],
+                    y=path_array[:, 1],
+                    mode='markers',
+                    marker=dict(
+                        size=sizes,
+                        color=list(range(n_points)),
+                        colorscale='RdYlBu_r',
+                        showscale=False,
+                        line=dict(color='white', width=1)
+                    ),
+                    name='Path Points',
+                    hovertemplate='Step %{marker.color}<br>a=%{x:.4f}<br>b=%{y:.4f}<extra></extra>'
+                ))
+
+            # Start point
+            fig.add_trace(go.Scatter(
+                x=[path_array[0, 0]],
+                y=[path_array[0, 1]],
+                mode='markers+text',
+                marker=dict(size=18, color='limegreen', symbol='circle',
+                           line=dict(color='darkgreen', width=3)),
+                text=['START'],
+                textposition='top center',
+                textfont=dict(size=12, color='darkgreen', family='Arial Black'),
+                name='Start Point'
+            ))
+
+            # Current point (animated marker)
+            fig.add_trace(go.Scatter(
+                x=[path_array[-1, 0]],
+                y=[path_array[-1, 1]],
+                mode='markers+text',
+                marker=dict(size=20, color='red', symbol='circle',
+                           line=dict(color='darkred', width=3)),
+                text=[f'Step {current_step}'],
+                textposition='bottom center',
+                textfont=dict(size=12, color='darkred', family='Arial Black'),
+                name='Current Point'
+            ))
+
+        fig.update_layout(
+            title=dict(
+                text=f'Optimization Progress - Step {current_step}/{len(path)-1 if path else 0}',
+                font=dict(size=16)
+            ),
+            xaxis_title=var_names[0],
+            yaxis_title=var_names[1],
+            height=500,
+            showlegend=True,
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor='rgba(255,255,255,0.8)'),
             hovermode='closest'
         )
 
@@ -861,11 +1249,7 @@ def main():
     if 'random_seed' not in st.session_state:
         st.session_state.random_seed = np.random.randint(0, 10000)
 
-    st.title("📐 Inequality Explorer")
-    st.markdown("""
-    *An interactive tool for exploring minimum/maximum of multi-variable functions
-    and discovering "Equality Cases" (Điểm rơi) in inequality problems.*
-    """)
+    st.markdown("## 📐 Inequality Explorer")
 
     # Sidebar configuration
     st.sidebar.header("⚙️ Configuration")
@@ -904,7 +1288,7 @@ def main():
         "Max Iterations",
         min_value=10,
         max_value=1000,
-        value=200,
+        value=50,  # Lower default for faster animation
         step=10,
         help="Maximum number of optimization iterations"
     )
@@ -915,7 +1299,7 @@ def main():
     for var in var_names:
         col1, col2 = st.sidebar.columns(2)
         with col1:
-            lb = st.number_input(f"{var} min", value=0.01, step=0.1, key=f"{var}_min")
+            lb = st.number_input(f"{var} min", value=-2.0, step=0.1, key=f"{var}_min")
         with col2:
             ub = st.number_input(f"{var} max", value=5.0, step=0.1, key=f"{var}_max")
         bounds.append((lb, ub))
@@ -927,102 +1311,181 @@ def main():
     show_convergence = st.sidebar.checkbox("Show Convergence Plot", value=True,
                                            help="Display how f(a,b) changes over iterations")
 
-    # Main content
-    col1, col2 = st.columns([1, 1])
+    # Animation options
+    st.sidebar.subheader("Animation")
+    animate_path = st.sidebar.checkbox("Animate Optimization", value=False,
+                                       help="Watch the optimization path update step-by-step")
+    animation_speed = st.sidebar.slider(
+        "Animation Speed (seconds)",
+        min_value=0.05,
+        max_value=2.0,
+        value=0.3,
+        step=0.05,
+        help="Delay between each step (lower = faster)",
+        disabled=not animate_path
+    )
+    steps_per_frame = st.sidebar.slider(
+        "Steps per Frame",
+        min_value=1,
+        max_value=20,
+        value=1,  # Default to 1 to show EVERY step
+        step=1,
+        help="1 = show every step, higher = skip steps",
+        disabled=not animate_path
+    )
 
-    with col1:
-        st.subheader("📝 Function Input")
-
-        # Example expressions
-        examples = {
-            '2 vars': {
-                'Simple Sum': ('a**2 + b**2', 'a + b - 2'),
-                'AM-GM Example': ('a + b + 1/a + 1/b', 'a*b - 1'),
-                'Cauchy-Schwarz': ('(a**2 + b**2) * (1/a**2 + 1/b**2)', ''),
-                'Rosenbrock': ('(1-a)**2 + 100*(b-a**2)**2', ''),
-                'Custom': ('', ''),
-            },
-            '3 vars': {
-                'Symmetric': ('a**2 + b**2 + c**2', 'a + b + c - 3'),
-                'AM-GM 3 vars': ('a + b + c + 1/a + 1/b + 1/c', 'a*b*c - 1'),
-                'Mixed': ('a**2 + b**2 + c**2 + 2/(a*b*c)', 'a + b + c - 3'),
-                'Custom': ('', ''),
-            }
+    # ===== SIDEBAR: All configuration =====
+    # Example expressions (LaTeX format for MathLive, Python format as fallback)
+    examples = {
+        '2 vars': {
+            'Quadratic (no constraint)': ('a^{2}+b^{2}', '', 'a**2 + b**2', ''),
+            'Quadratic + constraint': ('a^{2}+b^{2}', 'a+b-2', 'a**2 + b**2', 'a + b - 2'),
+            'AM-GM Example': ('a+b+\\frac{1}{a}+\\frac{1}{b}', '', 'a + b + 1/a + 1/b', ''),
+            'Rosenbrock': ('(1-a)^{2}+100(b-a^{2})^{2}', '', '(1-a)**2 + 100*(b-a**2)**2', ''),
+            'Himmelblau': ('(a^{2}+b-11)^{2}+(a+b^{2}-7)^{2}', '', '(a**2 + b - 11)**2 + (a + b**2 - 7)**2', ''),
+            'Custom': ('', '', '', ''),
+        },
+        '3 vars': {
+            'Quadratic 3D': ('a^{2}+b^{2}+c^{2}', '', 'a**2 + b**2 + c**2', ''),
+            'Symmetric + constraint': ('a^{2}+b^{2}+c^{2}', 'a+b+c-3', 'a**2 + b**2 + c**2', 'a + b + c - 3'),
+            'AM-GM 3 vars': ('a+b+c+\\frac{1}{a}+\\frac{1}{b}+\\frac{1}{c}', '', 'a + b + c + 1/a + 1/b + 1/c', ''),
+            'Custom': ('', '', '', ''),
         }
+    }
 
-        example_key = '2 vars' if num_vars == 2 else '3 vars'
-        selected_example = st.selectbox(
-            "Load Example",
-            options=list(examples[example_key].keys()),
-            index=0
-        )
+    st.sidebar.subheader("Load Example")
+    example_key = '2 vars' if num_vars == 2 else '3 vars'
+    selected_example = st.sidebar.selectbox(
+        "Example",
+        options=list(examples[example_key].keys()),
+        index=0,
+        label_visibility="collapsed"
+    )
+    default_latex, default_constraint_latex, default_python, default_constraint_python = examples[example_key][selected_example]
 
-        default_expr, default_constraint = examples[example_key][selected_example]
+    st.sidebar.subheader("Input Mode")
+    input_mode = st.sidebar.radio(
+        "Input Mode",
+        options=['Visual (LaTeX)', 'Text (Python)'],
+        horizontal=True,
+        help="Visual: Math editor. Text: Python expressions.",
+        label_visibility="collapsed"
+    )
 
-        # Function expression input
-        func_expr = st.text_input(
-            f"f({', '.join(var_names)}) =",
-            value=default_expr,
-            placeholder=f"e.g., a**2 + b**2 + 1/a + 1/b",
-            help="Enter mathematical expression. Use ** for power, sqrt(), sin(), cos(), exp(), log()"
-        )
+    st.sidebar.subheader("Find")
+    find_type = st.sidebar.radio(
+        "Find",
+        options=['Minimum', 'Maximum'],
+        horizontal=True,
+        label_visibility="collapsed"
+    )
 
-        # Constraint input
-        constraint_expr = st.text_input(
-            "Constraint (= 0)",
-            value=default_constraint,
-            placeholder="e.g., a + b - 2 (means a + b = 2)",
-            help="Enter constraint equation. Leave empty for no constraint."
-        )
+    st.sidebar.subheader("Starting Point")
+    start_mode = st.sidebar.radio(
+        "Starting Point Mode",
+        options=['Random', 'Custom'],
+        horizontal=True,
+        label_visibility="collapsed"
+    )
 
-        # Find min or max
-        find_type = st.radio(
-            "Find",
-            options=['Minimum', 'Maximum'],
-            horizontal=True
-        )
+    if start_mode == 'Custom':
+        start_cols = st.sidebar.columns(num_vars)
+        start_point = []
+        for i, var in enumerate(var_names):
+            with start_cols[i]:
+                val = st.number_input(f"{var}₀", value=2.0, step=0.1, key=f"start_{var}")
+                start_point.append(val)
+        start_point = np.array(start_point)
+    else:
+        start_point = None
+        if st.sidebar.button("🎲 Randomize"):
+            st.session_state.random_seed = np.random.randint(0, 10000)
+            st.rerun()
+        st.sidebar.caption(f"Seed: {st.session_state.random_seed}")
 
-    with col2:
-        st.subheader("📊 Starting Point")
+    st.sidebar.subheader("Plot Resolution")
+    resolution = st.sidebar.slider(
+        "Resolution",
+        min_value=20,
+        max_value=100,
+        value=50,
+        label_visibility="collapsed"
+    )
 
-        # Starting point options
-        start_mode = st.radio(
-            "Starting Point Mode",
-            options=['Random', 'Custom'],
-            horizontal=True,
-            help="Choose random or specify custom starting point"
-        )
+    # ===== MAIN CONTENT: Compact formula editor =====
+    if input_mode == 'Visual (LaTeX)':
+        from st_mathlive import mathfield
 
-        if start_mode == 'Custom':
-            st.write("Specify starting coordinates:")
-            start_cols = st.columns(num_vars)
-            start_point = []
-            for i, var in enumerate(var_names):
-                with start_cols[i]:
-                    val = st.number_input(f"{var}₀", value=2.0, step=0.1, key=f"start_{var}")
-                    start_point.append(val)
-            start_point = np.array(start_point)
+        # Compact header with function label inline
+        func_initial = default_latex if default_latex else "a^{2}+b^{2}"
+
+        col_label, col_editor = st.columns([1, 5])
+        with col_label:
+            st.markdown(f"**f({', '.join(var_names)}) =**")
+        with col_editor:
+            func_result = mathfield(value=func_initial)
+
+        if func_result:
+            if isinstance(func_result, tuple):
+                func_latex, func_mathml = func_result
+            elif isinstance(func_result, list) and len(func_result) >= 1:
+                func_latex = func_result[0] if func_result[0] else ""
+            else:
+                func_latex = str(func_result) if func_result else ""
         else:
-            start_point = None
-            # Randomize button
-            if st.button("🎲 Randomize Start Point", help="Generate new random starting point"):
-                st.session_state.random_seed = np.random.randint(0, 10000)
-                st.rerun()
+            func_latex = func_initial
 
-            st.caption(f"Current seed: {st.session_state.random_seed}")
+        if func_latex and func_latex.strip():
+            func_expr_cleaned = LaTeXParser.clean_latex_to_sympy(func_latex)
+        else:
+            func_expr_cleaned = ""
 
-        st.subheader("📈 Plot Settings")
-        resolution = st.slider(
-            "Plot Resolution",
-            min_value=20,
-            max_value=100,
-            value=50,
-            help="Higher resolution = smoother plot but slower"
-        )
+        # Constraint on same row style
+        col_clabel, col_cinput = st.columns([1, 5])
+        with col_clabel:
+            st.markdown("**g =** *(optional)*")
+        with col_cinput:
+            constraint_initial = default_constraint_latex if default_constraint_latex else ""
+            constraint_latex = st.text_input(
+                "Constraint",
+                value=constraint_initial,
+                placeholder="e.g., a + b - 2 (constraint = 0)",
+                label_visibility="collapsed"
+            )
 
-    # Run optimization button
-    st.markdown("---")
+        if constraint_latex and constraint_latex.strip():
+            constraint_expr_cleaned = LaTeXParser.clean_latex_to_sympy(constraint_latex)
+        else:
+            constraint_expr_cleaned = ""
 
+        func_expr = func_expr_cleaned
+        constraint_expr = constraint_expr_cleaned
+
+    else:
+        # Text mode - compact layout
+        col_label, col_editor = st.columns([1, 5])
+        with col_label:
+            st.markdown(f"**f({', '.join(var_names)}) =**")
+        with col_editor:
+            func_expr = st.text_input(
+                "Function",
+                value=default_python,
+                placeholder=f"e.g., a**2 + b**2 + 1/a + 1/b",
+                label_visibility="collapsed"
+            )
+
+        col_clabel, col_cinput = st.columns([1, 5])
+        with col_clabel:
+            st.markdown("**g =** *(optional)*")
+        with col_cinput:
+            constraint_expr = st.text_input(
+                "Constraint (= 0)",
+                value=default_constraint_python,
+                placeholder="e.g., a + b - 2",
+                label_visibility="collapsed"
+            )
+
+    # Run optimization button (compact)
     run_col1, run_col2 = st.columns([3, 1])
     with run_col1:
         run_button = st.button("🚀 Run Optimization", type="primary", use_container_width=True)
@@ -1060,22 +1523,49 @@ def main():
             if start_point is None:
                 start_point = np.array([np.random.uniform(lb, ub) for lb, ub in bounds])
 
+                # If there's a constraint, try to find a starting point that satisfies it
+                if constraint_func is not None:
+                    # For simple linear constraints like a + b = c, adjust start point
+                    # Try to project onto constraint by simple search
+                    best_start = start_point.copy()
+                    best_violation = abs(constraint_func(*start_point))
+
+                    for _ in range(100):
+                        test_point = np.array([np.random.uniform(lb, ub) for lb, ub in bounds])
+                        violation = abs(constraint_func(*test_point))
+                        if violation < best_violation:
+                            best_violation = violation
+                            best_start = test_point
+
+                    start_point = best_start
+
             # Run optimization
+            # Use scipy for constrained optimization (much better), gradient descent for unconstrained
+            effective_method = optimization_method
+            if constraint_func is not None and optimization_method == 'gradient_descent':
+                st.warning("Note: Using SciPy for constrained optimization (more accurate). Gradient descent with constraints uses penalty method which may be less precise.")
+
             with st.spinner("Optimizing..."):
                 if find_type == 'Maximum':
                     result = engine.find_maximum(
-                        method=optimization_method,
+                        method=effective_method,
                         learning_rate=learning_rate,
                         iterations=iterations,
                         x0=start_point
                     )
                 else:
                     result = engine.optimize(
-                        method=optimization_method,
+                        method=effective_method,
                         learning_rate=learning_rate,
                         iterations=iterations,
                         x0=start_point
                     )
+
+            # Verify constraint satisfaction
+            if constraint_func is not None:
+                constraint_violation = abs(constraint_func(*result['x_optimal']))
+                if constraint_violation > 0.01:
+                    st.warning(f"Constraint violation: {constraint_violation:.4f}. Try using SciPy method or adjusting parameters.")
 
             # Display results
             st.markdown("---")
@@ -1104,22 +1594,8 @@ def main():
             if num_vars == 2:
                 st.subheader("🎨 Visualizations")
 
-                # Main contour plot with trajectory
-                st.markdown("#### Optimization Trajectory")
-                fig_contour = Visualizer.create_contour_with_trajectory(
-                    objective_func,
-                    x_range=bounds[0],
-                    y_range=bounds[1],
-                    path=result['path'],
-                    resolution=resolution,
-                    var_names=var_names,
-                    constraint_func=constraint_func,
-                    show_arrows=show_arrows
-                )
-                st.plotly_chart(fig_contour, use_container_width=True)
-
-                # Two columns for 3D and convergence
-                viz_col1, viz_col2 = st.columns(2)
+                # Two columns: 3D Surface (left) and Contour/Animation (right)
+                viz_col1, viz_col2 = st.columns([1, 1])
 
                 with viz_col1:
                     # 3D Surface Plot
@@ -1134,17 +1610,191 @@ def main():
                     fig_3d = Visualizer.add_optimization_path_3d(
                         fig_3d, result['path'], objective_func
                     )
+                    fig_3d.update_layout(height=500)
                     st.plotly_chart(fig_3d, use_container_width=True)
 
                 with viz_col2:
-                    if show_convergence and result.get('f_values'):
-                        # Convergence Plot
-                        st.markdown("#### Convergence")
-                        fig_conv = Visualizer.create_convergence_plot(
-                            result['f_values'],
-                            learning_rate
+                    st.markdown("#### Optimization Trajectory")
+                    if animate_path and len(result['path']) > 1:
+                        # Animated visualization using matplotlib (faster updates)
+                        import matplotlib.pyplot as plt
+                        import matplotlib.patches as mpatches
+
+                        total_steps = len(result['path'])
+                        path_array = np.array(result['path'])
+
+                        st.info(f"🎬 Animating {total_steps} steps...")
+
+                        # Pre-compute contour data ONCE
+                        x = np.linspace(bounds[0][0], bounds[0][1], resolution)
+                        y = np.linspace(bounds[1][0], bounds[1][1], resolution)
+                        X, Y = np.meshgrid(x, y)
+                        Z = np.zeros_like(X)
+                        for i in range(X.shape[0]):
+                            for j in range(X.shape[1]):
+                                try:
+                                    Z[i, j] = objective_func(X[i, j], Y[i, j])
+                                except:
+                                    Z[i, j] = np.nan
+
+                        # Create placeholders
+                        plot_placeholder = st.empty()
+                        status_text = st.empty()
+
+                        # Pre-compute constraint if exists
+                        C = None
+                        if constraint_func is not None:
+                            C = np.zeros_like(X)
+                            for i in range(X.shape[0]):
+                                for j in range(X.shape[1]):
+                                    try:
+                                        C[i, j] = constraint_func(X[i, j], Y[i, j])
+                                    except:
+                                        C[i, j] = np.nan
+
+                        # Get start and end points
+                        start_point = path_array[0]
+                        end_point = path_array[-1]  # Minimum point (pre-calculated)
+
+                        # Animation loop - ADD new point and line each frame
+                        for step in range(1, total_steps + 1, steps_per_frame):
+                            current_step = min(step, total_steps)
+
+                            # Create SMALLER figure for side-by-side layout
+                            fig, ax = plt.subplots(figsize=(6, 5))
+
+                            # Draw contour background
+                            ax.contourf(X, Y, Z, levels=20, cmap='viridis', alpha=0.5)
+                            contour = ax.contour(X, Y, Z, levels=20, colors='blue', linewidths=0.5)
+                            ax.clabel(contour, inline=True, fontsize=7, fmt='%.1f')
+
+                            # Draw constraint if exists
+                            if C is not None:
+                                ax.contour(X, Y, C, levels=[0], colors='red', linewidths=2, linestyles='--')
+
+                            # Always show START point (green)
+                            ax.scatter(start_point[0], start_point[1],
+                                      c='limegreen', s=150, marker='o', edgecolors='darkgreen',
+                                      linewidths=2, zorder=15, label='Start')
+
+                            # Always show MINIMUM point (gold star) - pre-calculated
+                            ax.scatter(end_point[0], end_point[1],
+                                      c='gold', s=200, marker='*', edgecolors='darkorange',
+                                      linewidths=2, zorder=15, label='Min')
+
+                            # Draw path UP TO current step (lines + points)
+                            current_path = path_array[:current_step]
+
+                            if len(current_path) >= 2:
+                                # Draw LINE from start to current (red line)
+                                ax.plot(current_path[:, 0], current_path[:, 1],
+                                       'r-', linewidth=2, zorder=10)
+
+                                # Draw all intermediate points (small red dots)
+                                ax.scatter(current_path[1:-1, 0], current_path[1:-1, 1],
+                                          c='red', s=30, zorder=12, alpha=0.8)
+
+                            # Draw CURRENT point (larger, highlighted)
+                            current_point = current_path[-1]
+                            ax.scatter(current_point[0], current_point[1],
+                                      c='red', s=150, marker='o', edgecolors='darkred',
+                                      linewidths=2, zorder=20)
+
+                            # Calculate gradient norm
+                            try:
+                                current_f = objective_func(*current_point)
+                                eps = 1e-5
+                                grad = np.zeros(2)
+                                for i in range(2):
+                                    p_plus = current_point.copy()
+                                    p_plus[i] += eps
+                                    p_minus = current_point.copy()
+                                    p_minus[i] -= eps
+                                    grad[i] = (objective_func(*p_plus) - objective_func(*p_minus)) / (2 * eps)
+                                grad_norm = np.linalg.norm(grad)
+                            except:
+                                current_f = 0
+                                grad_norm = 0
+
+                            # Title
+                            ax.set_xlabel(var_names[0], fontsize=10)
+                            ax.set_ylabel(var_names[1], fontsize=10)
+                            ax.set_title(f'η={learning_rate}; iter={current_step-1}/{total_steps-1}; ||∇f||={grad_norm:.3f}',
+                                        fontsize=10)
+                            ax.legend(loc='upper right', fontsize=8)
+
+                            plt.tight_layout()
+
+                            # Update plot
+                            plot_placeholder.pyplot(fig)
+                            plt.close(fig)
+
+                            # Update status text
+                            status_text.markdown(
+                                f"**iter {current_step-1}/{total_steps-1}** | "
+                                f"f = {current_f:.4f}"
+                            )
+
+                            time.sleep(animation_speed)
+
+                        # Final status
+                        status_text.markdown("**✅ Complete!**")
+
+                        # Show final frame
+                        fig, ax = plt.subplots(figsize=(6, 5))
+                        ax.contourf(X, Y, Z, levels=20, cmap='viridis', alpha=0.5)
+                        contour = ax.contour(X, Y, Z, levels=20, colors='blue', linewidths=0.5)
+                        ax.clabel(contour, inline=True, fontsize=7, fmt='%.1f')
+
+                        if constraint_func is not None:
+                            ax.contour(X, Y, C, levels=[0], colors='red', linewidths=2, linestyles='--')
+
+                        # Full path
+                        ax.plot(path_array[:, 0], path_array[:, 1], 'r-', linewidth=2)
+                        ax.scatter(path_array[1:-1, 0], path_array[1:-1, 1], c='red', s=20, zorder=5, alpha=0.7)
+
+                        # Start (green)
+                        ax.scatter(path_array[0, 0], path_array[0, 1],
+                                  c='limegreen', s=150, marker='o', edgecolors='darkgreen',
+                                  linewidths=2, zorder=10, label='Start')
+
+                        # End (gold star)
+                        ax.scatter(path_array[-1, 0], path_array[-1, 1],
+                                  c='gold', s=250, marker='*', edgecolors='darkorange',
+                                  linewidths=2, zorder=10, label='Min ★')
+
+                        ax.set_xlabel(var_names[0], fontsize=10)
+                        ax.set_ylabel(var_names[1], fontsize=10)
+                        ax.set_title(f'f* = {result["f_optimal"]:.4f}', fontsize=10)
+                        ax.legend(loc='upper right', fontsize=8)
+                        plt.tight_layout()
+
+                        plot_placeholder.pyplot(fig)
+                        plt.close(fig)
+
+                    else:
+                        # Static visualization (no animation)
+                        fig_contour = Visualizer.create_contour_with_trajectory(
+                            objective_func,
+                            x_range=bounds[0],
+                            y_range=bounds[1],
+                            path=result['path'],
+                            resolution=resolution,
+                            var_names=var_names,
+                            constraint_func=constraint_func,
+                            show_arrows=show_arrows
                         )
-                        st.plotly_chart(fig_conv, use_container_width=True)
+                        fig_contour.update_layout(height=500)
+                        st.plotly_chart(fig_contour, use_container_width=True)
+
+                # Convergence plot below
+                if show_convergence and result.get('f_values'):
+                    st.markdown("#### Convergence")
+                    fig_conv = Visualizer.create_convergence_plot(
+                        result['f_values'],
+                        learning_rate
+                    )
+                    st.plotly_chart(fig_conv, use_container_width=True)
 
                     # Path statistics
                     st.markdown("#### Path Statistics")

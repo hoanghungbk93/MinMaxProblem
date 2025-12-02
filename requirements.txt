@@ -13,5 +13,11 @@ scipy>=1.11.0
 # Interactive plotting
 plotly>=5.18.0
 
+# Symbolic mathematics
+sympy>=1.12
+
+# Visual math editor component
+streamlit-mathlive>=0.0.3
+
 # Optional: For enhanced performance (uncomment if needed)
 # numba>=0.58.0
