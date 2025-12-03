@@ -13,6 +13,230 @@ class Visualizer:
     """Create interactive visualizations for optimization."""
 
     @staticmethod
+    def create_2d_plot(func: Callable, x_range: Tuple[float, float],
+                       resolution: int = 100, var_name: str = 'a') -> go.Figure:
+        """Create 2D line plot for single variable function."""
+        x = np.linspace(x_range[0], x_range[1], resolution)
+        y = np.zeros_like(x)
+
+        for i in range(len(x)):
+            try:
+                y[i] = func(x[i])
+            except:
+                y[i] = np.nan
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=x, y=y,
+            mode='lines',
+            line=dict(color='blue', width=2),
+            name=f'f({var_name})'
+        ))
+
+        fig.update_layout(
+            title=f'Function f({var_name})',
+            xaxis_title=var_name,
+            yaxis_title=f'f({var_name})',
+            height=450,
+            showlegend=True
+        )
+
+        return fig
+
+    @staticmethod
+    def add_optimization_path_2d(fig: go.Figure, path: List[np.ndarray],
+                                  func: Callable, var_name: str = 'a') -> go.Figure:
+        """Add optimization path to 2D plot."""
+        if len(path) < 2:
+            return fig
+
+        path_x = [p[0] for p in path]
+        path_y = []
+        for p in path:
+            try:
+                path_y.append(func(p[0]))
+            except:
+                path_y.append(np.nan)
+
+        # Add path points
+        fig.add_trace(go.Scatter(
+            x=path_x, y=path_y,
+            mode='lines+markers',
+            line=dict(color='red', width=2, dash='dot'),
+            marker=dict(size=6, color=list(range(len(path))),
+                       colorscale='Reds', showscale=False),
+            name='Optimization Path'
+        ))
+
+        # Start point
+        fig.add_trace(go.Scatter(
+            x=[path_x[0]], y=[path_y[0]],
+            mode='markers+text',
+            marker=dict(size=14, color='limegreen', symbol='circle',
+                       line=dict(color='darkgreen', width=2)),
+            text=['START'], textposition='top center',
+            textfont=dict(size=11, color='darkgreen'),
+            name='Start Point'
+        ))
+
+        # Optimal point
+        fig.add_trace(go.Scatter(
+            x=[path_x[-1]], y=[path_y[-1]],
+            mode='markers+text',
+            marker=dict(size=16, color='gold', symbol='star',
+                       line=dict(color='darkorange', width=2)),
+            text=['OPTIMAL'], textposition='bottom center',
+            textfont=dict(size=12, color='darkorange'),
+            name='Optimal Point'
+        ))
+
+        return fig
+
+    @staticmethod
+    def create_1d_contour_animation(func: Callable, x_range: Tuple[float, float],
+                                     path: List[np.ndarray], resolution: int = 100,
+                                     var_name: str = 'a', animation_speed: int = 500) -> go.Figure:
+        """Create animated 1D plot showing optimization path with gradient coloring."""
+        x = np.linspace(x_range[0], x_range[1], resolution)
+        y = np.zeros_like(x)
+
+        for i in range(len(x)):
+            try:
+                y[i] = func(x[i])
+            except:
+                y[i] = np.nan
+
+        path_array = np.array(path)
+        n_frames = len(path_array)
+
+        # Compute f values for path
+        f_values = []
+        for pt in path_array:
+            try:
+                f_values.append(func(pt[0]))
+            except:
+                f_values.append(np.nan)
+
+        fig = go.Figure()
+
+        # Base function curve
+        fig.add_trace(go.Scatter(
+            x=x, y=y,
+            mode='lines',
+            line=dict(color='blue', width=2),
+            name=f'f({var_name})'
+        ))
+
+        # Start point
+        fig.add_trace(go.Scatter(
+            x=[path_array[0, 0]], y=[f_values[0]],
+            mode='markers+text',
+            marker=dict(size=14, color='limegreen', symbol='circle',
+                       line=dict(color='darkgreen', width=2)),
+            text=['START'], textposition='top center',
+            textfont=dict(size=11, color='darkgreen'),
+            name='Start'
+        ))
+
+        # Optimal point
+        fig.add_trace(go.Scatter(
+            x=[path_array[-1, 0]], y=[f_values[-1]],
+            mode='markers+text',
+            marker=dict(size=16, color='gold', symbol='star',
+                       line=dict(color='darkorange', width=2)),
+            text=['OPTIMAL'], textposition='bottom center',
+            textfont=dict(size=12, color='darkorange'),
+            name='Optimal'
+        ))
+
+        # Path line (animated)
+        fig.add_trace(go.Scatter(
+            x=[path_array[0, 0]], y=[f_values[0]],
+            mode='lines+markers',
+            line=dict(color='red', width=3),
+            marker=dict(size=6, color='red'),
+            name='Path'
+        ))
+
+        # Current position (animated)
+        fig.add_trace(go.Scatter(
+            x=[path_array[0, 0]], y=[f_values[0]],
+            mode='markers',
+            marker=dict(size=14, color='red', symbol='circle',
+                       line=dict(color='darkred', width=2)),
+            name='Current'
+        ))
+
+        # Create frames
+        frames = []
+        for k in range(1, n_frames + 1):
+            curr_x = path_array[k-1, 0]
+            curr_f = f_values[k-1]
+
+            frame_data = [
+                # Base curve
+                go.Scatter(x=x, y=y, mode='lines', line=dict(color='blue', width=2), name=f'f({var_name})'),
+                # Start
+                go.Scatter(x=[path_array[0, 0]], y=[f_values[0]], mode='markers+text',
+                          marker=dict(size=14, color='limegreen', symbol='circle', line=dict(color='darkgreen', width=2)),
+                          text=['START'], textposition='top center', textfont=dict(size=11, color='darkgreen'), name='Start'),
+                # Optimal
+                go.Scatter(x=[path_array[-1, 0]], y=[f_values[-1]], mode='markers+text',
+                          marker=dict(size=16, color='gold', symbol='star', line=dict(color='darkorange', width=2)),
+                          text=['OPTIMAL'], textposition='bottom center', textfont=dict(size=12, color='darkorange'), name='Optimal'),
+                # Path (growing)
+                go.Scatter(x=[p[0] for p in path_array[:k]], y=f_values[:k], mode='lines+markers',
+                          line=dict(color='red', width=3), marker=dict(size=6, color='red'), name='Path'),
+                # Current position
+                go.Scatter(x=[curr_x], y=[curr_f], mode='markers',
+                          marker=dict(size=14, color='red', symbol='circle', line=dict(color='darkred', width=2)), name='Current')
+            ]
+
+            frame_title = f"Step {k}/{n_frames} | {var_name}={curr_x:.4f}, f={curr_f:.4f}"
+            frames.append(go.Frame(data=frame_data, name=str(k),
+                                  layout=go.Layout(title=dict(text=frame_title, font=dict(size=14)))))
+
+        fig.frames = frames
+
+        # Initial title
+        init_title = f"Step 1/{n_frames} | {var_name}={path_array[0, 0]:.4f}, f={f_values[0]:.4f}"
+
+        fig.update_layout(
+            title=dict(text=init_title, font=dict(size=14)),
+            xaxis_title=var_name,
+            yaxis_title=f'f({var_name})',
+            height=450,
+            showlegend=True,
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor='rgba(255,255,255,0.8)'),
+            updatemenus=[{
+                'type': 'buttons',
+                'showactive': False,
+                'y': 1.15, 'x': 0.5, 'xanchor': 'center',
+                'buttons': [
+                    {'label': '▶ Play', 'method': 'animate',
+                     'args': [None, {'frame': {'duration': animation_speed, 'redraw': True},
+                                    'fromcurrent': True, 'mode': 'immediate', 'transition': {'duration': 0}}]},
+                    {'label': '⏸ Pause', 'method': 'animate',
+                     'args': [[None], {'frame': {'duration': 0, 'redraw': True}, 'mode': 'immediate'}]}
+                ]
+            }],
+            sliders=[{
+                'active': 0,
+                'yanchor': 'top', 'xanchor': 'left',
+                'currentvalue': {'prefix': 'Step: ', 'visible': True, 'xanchor': 'center'},
+                'transition': {'duration': 0},
+                'pad': {'b': 10, 't': 50},
+                'len': 0.9, 'x': 0.05, 'y': 0,
+                'steps': [{'args': [[str(k)], {'frame': {'duration': 0, 'redraw': True},
+                                              'mode': 'immediate', 'transition': {'duration': 0}}],
+                          'label': str(k), 'method': 'animate'} for k in range(1, n_frames + 1)]
+            }]
+        )
+
+        return fig
+
+    @staticmethod
     def create_3d_surface(func: Callable, x_range: Tuple[float, float],
                           y_range: Tuple[float, float], resolution: int = 50,
                           var_names: List[str] = ['a', 'b']) -> go.Figure:
@@ -25,9 +249,25 @@ class Visualizer:
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 try:
-                    Z[i, j] = func(X[i, j], Y[i, j])
+                    val = func(X[i, j], Y[i, j])
+                    # Handle infinity and very large values
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e6:
+                        Z[i, j] = np.nan
+                    else:
+                        Z[i, j] = val
                 except:
                     Z[i, j] = np.nan
+
+        # Clip z values to reasonable range for visualization
+        valid_z = Z[~np.isnan(Z)]
+        if len(valid_z) > 0:
+            z_min = np.percentile(valid_z, 5)   # Use 5th percentile as min
+            z_max = np.percentile(valid_z, 95)  # Use 95th percentile as max
+            # Add some padding
+            z_range = z_max - z_min
+            z_min_clip = z_min - 0.1 * z_range
+            z_max_clip = z_max + 0.5 * z_range
+            Z = np.clip(Z, z_min_clip, z_max_clip)
 
         fig = go.Figure(data=[go.Surface(
             x=X, y=Y, z=Z,
@@ -117,9 +357,20 @@ class Visualizer:
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 try:
-                    Z[i, j] = func(X[i, j], Y[i, j])
+                    val = func(X[i, j], Y[i, j])
+                    # Handle infinity and very large values
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e6:
+                        Z[i, j] = np.nan
+                    else:
+                        Z[i, j] = val
                 except:
                     Z[i, j] = np.nan
+
+        # Clip z values to reasonable range for visualization
+        valid_z = Z[~np.isnan(Z)]
+        if len(valid_z) > 0:
+            z_max = np.percentile(valid_z, 95)
+            Z = np.clip(Z, None, z_max * 1.5)
 
         fig = go.Figure()
 
@@ -272,9 +523,20 @@ class Visualizer:
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 try:
-                    Z[i, j] = func(X[i, j], Y[i, j])
+                    val = func(X[i, j], Y[i, j])
+                    # Handle infinity and very large values
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e6:
+                        Z[i, j] = np.nan
+                    else:
+                        Z[i, j] = val
                 except:
                     Z[i, j] = np.nan
+
+        # Clip z values to reasonable range for visualization
+        valid_z = Z[~np.isnan(Z)]
+        if len(valid_z) > 0:
+            z_max = np.percentile(valid_z, 95)
+            Z = np.clip(Z, None, z_max * 1.5)
 
         path_array = np.array(path)
         n_frames = len(path_array)
@@ -518,9 +780,20 @@ class Visualizer:
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 try:
-                    Z[i, j] = func(X[i, j], Y[i, j])
+                    val = func(X[i, j], Y[i, j])
+                    # Handle infinity and very large values
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e6:
+                        Z[i, j] = np.nan
+                    else:
+                        Z[i, j] = val
                 except:
                     Z[i, j] = np.nan
+
+        # Clip z values to reasonable range for visualization
+        valid_z = Z[~np.isnan(Z)]
+        if len(valid_z) > 0:
+            z_max = np.percentile(valid_z, 95)
+            Z = np.clip(Z, None, z_max * 1.5)
 
         fig = go.Figure()
 
@@ -572,9 +845,20 @@ class Visualizer:
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 try:
-                    Z[i, j] = func(X[i, j], Y[i, j])
+                    val = func(X[i, j], Y[i, j])
+                    # Handle infinity and very large values
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e6:
+                        Z[i, j] = np.nan
+                    else:
+                        Z[i, j] = val
                 except:
                     Z[i, j] = np.nan
+
+        # Clip z values to reasonable range for visualization
+        valid_z = Z[~np.isnan(Z)]
+        if len(valid_z) > 0:
+            z_max = np.percentile(valid_z, 95)
+            Z = np.clip(Z, None, z_max * 1.5)
 
         path_array = np.array(path)
         n_total = len(path_array)
@@ -671,9 +955,20 @@ class Visualizer:
         for i in range(X.shape[0]):
             for j in range(X.shape[1]):
                 try:
-                    Z[i, j] = func(X[i, j], Y[i, j])
+                    val = func(X[i, j], Y[i, j])
+                    # Handle infinity and very large values
+                    if np.isinf(val) or np.isnan(val) or abs(val) > 1e6:
+                        Z[i, j] = np.nan
+                    else:
+                        Z[i, j] = val
                 except:
                     Z[i, j] = np.nan
+
+        # Clip z values to reasonable range for visualization
+        valid_z = Z[~np.isnan(Z)]
+        if len(valid_z) > 0:
+            z_max = np.percentile(valid_z, 95)
+            Z = np.clip(Z, None, z_max * 1.5)
 
         path_array = np.array(path)
         n_frames = len(path_array)

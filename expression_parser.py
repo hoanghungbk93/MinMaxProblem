@@ -82,7 +82,14 @@ class SafeExpressionParser:
         try:
             numpy_func, _, error = LaTeXParser.create_numpy_function(prepared_expr, variables)
             if numpy_func is not None:
-                return numpy_func
+                # Wrap to ensure float output
+                def wrapped_func(*args):
+                    result = numpy_func(*args)
+                    # Convert SymPy/numpy objects to Python float
+                    if hasattr(result, 'evalf'):
+                        return float(result.evalf())
+                    return float(result)
+                return wrapped_func
         except Exception:
             pass
 
@@ -96,7 +103,11 @@ class SafeExpressionParser:
                 namespace[var] = val
 
             try:
-                return eval(prepared_expr, {"__builtins__": {}}, namespace)
+                result = eval(prepared_expr, {"__builtins__": {}}, namespace)
+                # Convert SymPy/numpy objects to Python float
+                if hasattr(result, 'evalf'):
+                    return float(result.evalf())
+                return float(result)
             except Exception as e:
                 raise ValueError(f"Error evaluating expression: {e}")
 

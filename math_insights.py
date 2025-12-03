@@ -19,6 +19,10 @@ class MathInsightAnalyzer:
         """Analyze the optimal point and generate insights."""
         insights = []
 
+        # Convert to numpy array and ensure float type
+        x_optimal = np.array([float(x) for x in x_optimal])
+        f_optimal = float(f_optimal)
+
         symmetry_insight = cls._check_symmetry(x_optimal, var_names)
         if symmetry_insight:
             insights.append(symmetry_insight)

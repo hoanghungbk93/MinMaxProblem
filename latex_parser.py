@@ -24,11 +24,24 @@ class LaTeXParser:
         - a^{2} -> (a)**(2)
         - \\cdot -> *
         - \\sin(x) -> sin(x)
+        - a^{2} + b^{2} = 1 -> a^{2} + b^{2} - 1 (for constraints)
         """
         if not latex_str or not latex_str.strip():
             return ""
 
         result = latex_str.strip()
+
+        # Handle equations: convert "expr = value" to "expr - value"
+        # This allows users to enter constraints like "a^2 + b^2 = 1"
+        if '=' in result and not any(op in result for op in ['>=', '<=', '!=']):
+            parts = result.split('=')
+            if len(parts) == 2:
+                left = parts[0].strip()
+                right = parts[1].strip()
+                if right and right != '0':
+                    result = f"({left}) - ({right})"
+                else:
+                    result = left
 
         # Remove display math delimiters if present
         result = re.sub(r'^\$\$?|\$\$?$', '', result)
@@ -56,7 +69,39 @@ class LaTeXParser:
         result = re.sub(r'\^(\d+)', r'**(\1)', result)
         result = re.sub(r'\^([a-zA-Z])', r'**(\1)', result)
 
+        # Handle logarithm with base: \log_{10}x -> log10(x), \log_{2}x -> log2(x)
+        # Must be handled BEFORE subscript removal
+        # Must be handled before general \log replacement
+        # Pattern: \log_{base}(arg) or \log_{base} arg or \log_{base}arg
+        def replace_log_base(match):
+            base = match.group(1)
+            arg = match.group(2) if match.group(2) else ''
+            if base == '10':
+                return f'log10({arg})' if arg else 'log10'
+            elif base == '2':
+                return f'log2({arg})' if arg else 'log2'
+            else:
+                # General base: log_b(x) = log(x)/log(b)
+                if arg:
+                    return f'(log({arg})/log({base}))'
+                else:
+                    return f'log'  # fallback
+
+        # \log_{base}{arg} - with braces around argument
+        result = re.sub(r'\\log_\{([^{}]+)\}\{([^{}]+)\}', replace_log_base, result)
+        # \log_{base}(arg) - with parentheses
+        result = re.sub(r'\\log_\{([^{}]+)\}\(([^()]+)\)', lambda m: replace_log_base(m), result)
+        # \log_{base}x - single letter/digit argument (no braces)
+        result = re.sub(r'\\log_\{([^{}]+)\}([a-zA-Z0-9])', replace_log_base, result)
+        # \log_{base} followed by space then variable - like \log_{10} a
+        result = re.sub(r'\\log_\{([^{}]+)\}\s+([a-zA-Z0-9])', replace_log_base, result)
+        # \log_{base} followed by space or end - standalone, will need implicit multiply later
+        result = re.sub(r'\\log_\{([^{}]+)\}(?=\s|$|[+\-*/)])', lambda m: f'log{m.group(1)}' if m.group(1) in ['10', '2'] else 'log', result)
+        # \log_base (no braces around base) - simpler form like \log_10 a
+        result = re.sub(r'\\log_(\d+)\s*([a-zA-Z])', lambda m: f'log{m.group(1)}({m.group(2)})' if m.group(1) in ['10', '2'] else f'(log({m.group(2)})/log({m.group(1)}))', result)
+
         # Handle subscripts (remove for now or convert to variable naming)
+        # This must come AFTER log base handling
         result = re.sub(r'_\{([^{}]+)\}', r'_\1', result)
         result = re.sub(r'_(\d+)', r'_\1', result)
 
@@ -111,14 +156,37 @@ class LaTeXParser:
         # Remove remaining backslashes and LaTeX commands
         result = re.sub(r'\\[a-zA-Z]+', '', result)
 
-        # Add implicit multiplication: 2a -> 2*a, a b -> a*b
+        # Add implicit multiplication: 2a -> 2*a, a b -> a*b, ab -> a*b
         # But NOT for function names like sqrt, sin, cos, etc.
-        func_names = ['sqrt', 'sin', 'cos', 'tan', 'log', 'ln', 'exp', 'abs', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh']
+        func_names = ['sqrt', 'sin', 'cos', 'tan', 'log', 'log10', 'log2', 'ln', 'exp', 'abs', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh', 'pi']
+        # Variables are single lowercase letters
+        variables = set('abcdxyz')
 
         # Number followed by letter
         result = re.sub(r'(\d)([a-zA-Z])', r'\1*\2', result)
         # Closing paren followed by letter or number
         result = re.sub(r'\)([a-zA-Z0-9])', r')*\1', result)
+
+        # Single letter variable followed by another single letter variable: ab -> a*b
+        # This handles implicit multiplication between variables
+        def add_mult_between_vars(match):
+            full = match.group(0)
+            # Don't split function names
+            for func in func_names:
+                if full == func:
+                    return full
+            # Split consecutive single-letter variables with *
+            result_chars = []
+            for i, c in enumerate(full):
+                result_chars.append(c)
+                if i < len(full) - 1:
+                    # Both current and next are single-letter variables
+                    if c.lower() in variables and full[i+1].lower() in variables:
+                        result_chars.append('*')
+            return ''.join(result_chars)
+
+        # Match sequences of 2+ lowercase letters that might be implicit multiplication
+        result = re.sub(r'[a-z]{2,}', add_mult_between_vars, result)
 
         # Letter/number followed by opening paren - but exclude function names
         def add_mult_before_paren(match):
@@ -132,6 +200,18 @@ class LaTeXParser:
 
         # Clean up extra spaces
         result = re.sub(r'\s+', ' ', result).strip()
+
+        # Convert uppercase variable letters to lowercase (A->a, B->b, C->c)
+        # But preserve function names and constants
+        def lowercase_vars(match):
+            char = match.group(0)
+            # Don't convert E (Euler's number) or other constants
+            if char == 'E':
+                return char
+            return char.lower()
+
+        # Only convert standalone uppercase letters that are likely variables
+        result = re.sub(r'(?<![a-zA-Z])([A-D])(?![a-zA-Z])', lowercase_vars, result)
 
         return result
 
